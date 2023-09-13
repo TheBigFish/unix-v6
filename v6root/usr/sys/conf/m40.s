@@ -535,24 +535,65 @@ _idle:
 	rts	pc
 
 .globl	_savu, _retu, _aretu
+/*
+ * void savu(int p[2])
+ * savu主要用来保存当前内核栈指针和r5寄存器的值到传入的数组p中。
+ */
 _savu:
+  /*
+  * PS | 11100000 -> PS
+  * 处理机状态字 PSW bit5-7 置 1，优先级为 7
+  * 关中断？
+  */
 	bis	$340,PS
+  /*
+   * 返回地址 -> r1
+   */
 	mov	(sp)+,r1
+  /*
+   * 参数地址 -> r0
+   */
 	mov	(sp),r0
+  /*
+   * 内核栈指针(r6)保存
+   */
 	mov	sp,(r0)+
+  /*
+   * r5 计存器保存
+   */
 	mov	r5,(r0)+
+  /*
+  * PS & 00011111 -> PS
+  * 处理机状态字 PSW bit5-7 置 0，优先级为 0
+  */
 	bic	$340,PS
 	jmp	(r1)
 
+/*
+ * void aretu(int p[2])
+ * 设置 sp = p[0], r5 = [p1]
+ */
 _aretu:
 	bis	$340,PS
 	mov	(sp)+,r1
 	mov	(sp),r0
 	br	1f
 
+/*
+ * void retu(int *p_addr)
+ * 设置u/内核栈区（内核虚拟地址0o140000～0o142000）指向新的物理块p_addr（一般是proc.p_addr），
+ * 再设置sp=u.u_rsav[0], r5=u.u_rsav[1]。
+ * retu会改变当前u变量
+ */
 _retu:
 	bis	$340,PS
+  /*
+   * 返回地址 -> r1
+   */
 	mov	(sp)+,r1
+  /*
+   * 参数p_addr -> KISA6
+   */
 	mov	(sp),KISA6
 	mov	$_u,r0
 1:
@@ -562,10 +603,18 @@ _retu:
 	jmp	(r1)
 
 .globl	_spl0, _spl1, _spl4, _spl5, _spl6, _spl7
+/*
+ * spl0设置PSW寄存器的中断屏蔽优先级=0，从而打开所有中断（自陷） 。
+ */
 _spl0:
 	bic	$340,PS
 	rts	pc
 
+/*
+ * spl1～spl7分别设置PSW寄存器的中断屏蔽优先级为1～7，
+ * 从而屏蔽对应级别以下（含）的中断。
+ * 它们主要用于实现全局数据操作的原子性，从而保证数据正确。
+ */
 _spl1:
 	bis	$40,PS
 	bic	$300,PS
@@ -706,44 +755,124 @@ dump:
 
 .globl	start, _end, _edata, _main
 start:
+  /*
+  * while(*((int *)SR0) &1);
+  */
 	bit	$1,SSR0
 	bne	start			/ loop if restart
+  /* reset指令复位所有总线设备（当然包括I/O设备）及相关寄存器。
+   * 现在，系统运行在内核模式，而且内存管理单元未启动。
+   * 也就是说，现在所有的地址引用都是物理地址。
+   */
 	reset
 
 / initialize systems segments
 
 	mov	$KISA0,r0
 	mov	$KISD0,r1
+  /*
+  * r4 赋值为 128
+  */
 	mov	$200,r4
 	clr	r2
+  /*
+  * 循环6次，设置KISA0-KISA5
+  */
 	mov	$6,r3
 1:
+  /*
+  * 设定内核页地址寄存器的值
+  * 从而指定页起始物理内存块号为r2
+  */
 	mov	r2,(r0)+
+  /*
+  * ED=0，PLF=127，ACF=11
+  * 指定页朝高地址方向自动延伸，
+  * 页大小为8K字节（注释是指4K字）
+  * 页操作权限为“读写”
+  */
 	mov	$77406,(r1)+		/ 4k rw
+  /*
+  * 每次把物理块号 r2 增加 r4 (128)，
+  * 作为下一个页地址寄存器的值（128*64 = 8K）
+  */
 	add	r4,r2
+  /*
+  * 自减计数器r3，若不为0则跳转，类似于do{}while(--i)。
+  */
 	sob	r3,1b
 
 / initialize user segment
 
+  /*
+  * r2 =（_end+63）/64
+  * 这里_end指向bss段的结尾，也是整个UNIX启动时，系统程序数据空间的结尾地址。
+  * 也就是说，UNIX程序数据空间的最后一个字节是_end-1，记为_end_vaild，
+  * 则_end=_end_valid+1，所以r2=（_end_valid+1+63）/64=_end_valid/64+1，
+  * 这样r2就指向了内存中最后一个有效数据区的下一个紧邻物理块。
+  */
 	mov	$_end+63.,r2
 	ash	$-6,r2
+  /*
+  * 保留r2的低10位，这样使r2 < 1024，
+  * 从而使r2指向的物理块位于64K地址空间内
+  */
 	bic	$!1777,r2
+  /*
+  * 设定6号内核页描述寄存器的值：PLF=USIZE（16）-1，ED=0，ACF=11。
+  * 从而该页大小为USIZE*64=1024字节，“读写”权限。
+  * 它用来存放进程u变量和进程内核栈空间。
+  */
 	mov	r2,(r0)+		/ ksr6 = sysu
 	mov	$usize-1\<8|6,(r1)+
 
 / initialize io segment
 / set up counts on supervisor segments
 
+  /*
+  * 映射 IO 虚拟地址248k - 256k
+  *
+  * 设定7号内核页地址寄存器和页描述寄存器的值。
+  * 其中，页地址寄存器的值为IO，IO = 7600（八进制，等于十进制3968，在m40．s文件末定义），
+  * 从而它所对应的物理地址为：3968*64=248K。
+  */
 	mov	$IO,(r0)+
+ /*
+  * 页描述寄存器值77406（8进制）表示该页长度为8K字节，“读写”权限。
+  */
 	mov	$77406,(r1)+		/ rw 4k
+ /*
+  * 至此，8个内核活动页寄存器已经全部设定完毕，
+  * 64K内核虚拟空间中的57K都已经映射到物理内存
+  * （第6号活动页寄存器只映射了1K）
+  */
+  /*
+  * 虚存中的[48K,49K]空间被映射到[_end, _end+1K]，并作为内核栈，
+  * 这从第28行可以看出来。_u引用C程序中的全局变量u，
+  * 它在．c第行定义（struct user{…}u），该结构变量所占空间为1K字节，
+  * 该变量被分配到固定地址0o140000 (48k)（在m40．s文件末定义），
+  * 可以知道它是属于6号活动页寄存器KISA6/KISD6空间。
+  */
 
 / get a sp and start segmentation
-
+  /*
+   */
 	mov	$_u+[usize*64.],sp
+  /*
+   * 启动内存管理单元，从这一步开始，
+   * 下面所有的地址引用（包括指令地址）都被解释成为虚拟地址，
+   * 它首先被内存管理单元翻译成物理地址，再进行访问。
+   */
 	inc	SSR0
 
 / clear bss
 
+  /*
+  * 清除bss段，即设置所有未初始化的全局变量为0。
+  * 注意这里的_edata和_end都是伪变量，由编译器生成，
+  * 分别指向data结束（bss段的起始）和bss段的结束地址。
+  * UNIX程序大小（0～_end）大概为29K
+  */
 	mov	$_edata,r0
 1:
 	clr	(r0)+
@@ -751,7 +880,9 @@ start:
 	blo	1b
 
 / clear user block
-
+  /*
+  * 清除全局变量u和内核栈空间
+  */
 	mov	$_u,r0
 1:
 	clr	(r0)+
@@ -760,7 +891,11 @@ start:
 
 / set up previous mode and call main
 / on return, enter user mode at 0R
-
+ /*
+ * 设置PSW寄存器的之前模式=用户，当前模式=内核，中断优先级为0（完全开中断）
+ * 然后跳转到C程序中main函数执行。
+ * PSW寄存器也在m40．s中定义：PS= 177776
+ */
 	mov	$30000,PS
 	jsr	pc,_main
 	mov	$170000,-(sp)
@@ -815,7 +950,7 @@ _u	= 140000
 usize	= 16.
 
 PS	= 177776
-SSR0	= 177572
+SSR0	= 177572  /状态和错误指示寄存器0 65402
 SSR2	= 177576
 KISA0	= 172340
 KISA6	= 172354

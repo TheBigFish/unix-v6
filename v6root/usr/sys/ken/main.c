@@ -148,10 +148,26 @@ sureg()
 		up =- 8;
 		rp =- 8;
 	}
+  /*
+   * 后向前设置UISA寄存器，使得UISA[i] = u.u_uisa[i] + u.u_procp->p_addr。
+   * 这样程序段物 理内存从u.u_procp->p_addr开始，
+   * 而数据段物理内存则从u.u_procp->p_addr+USIZE开始
+   */
 	while(rp > &UISA->r[0])
 		*--rp = *--up + a;
+  /* 
+   * 后续调整程序段使用
+   * rp[] -= a -> rp[] = u.u_procp->p_addr - (u.u_procp->p_addr - u.u_procp->p_textp->x_caddr)
+   *       = u.u_procp->p_textp->x_caddr
+   * 这里太绕了
+   */
 	if((up=u.u_procp->p_textp) != NULL)
 		a =- up->x_caddr;
+  /*
+   * 重启用一个循环
+   *  - 复制 UISD 
+   *  - 调整程序段地址
+   */
 	up = &u.u_uisd[16];
 	rp = &UISD->r[16];
 	if(cputype == 40) {
@@ -160,6 +176,9 @@ sureg()
 	}
 	while(rp > &UISD->r[0]) {
 		*--rp = *--up;
+    /*
+     * 所有没有写权限（程序段）的项都要执行调整
+     */
 		if((*rp & WO) == 0)
 			rp[(UISA-UISD)/2] =- a;
 	}
@@ -173,6 +192,13 @@ sureg()
  * The argument sep specifies if the
  * text and data+stack segments are to
  * be separated.
+ */
+/*
+ * 设置软活动页段寄存器来实现所传入的3个参数大小的
+ * 伪文本（程序）段、数据段、堆栈段大小。
+ * 参数 sep 指示 文本和数据/栈段是否分离
+ *
+ * 注意单位为 块，64字节。
  */
 estabur(nt, nd, ns, sep)
 {
@@ -191,21 +217,35 @@ estabur(nt, nd, ns, sep)
 	a = 0;
 	ap = &u.u_uisa[0];
 	dp = &u.u_uisd[0];
+  /*
+   * 先按照每个段 PAR/PDR (APR) 管理 128 个块（最大128块）
+   */
 	while(nt >= 128) {
 		*dp++ = (127<<8) | RO;
 		*ap++ = a;
 		a =+ 128;
 		nt =- 128;
 	}
+  /*
+   * 小于 128块 的最后一段
+   */
 	if(nt) {
 		*dp++ = ((nt-1)<<8) | RO;
 		*ap++ = a;
 	}
+  /*
+   * sep 为 1，PDP11/70，需要填充剩余的前8项寄存器
+   * 进程的数据段和栈段要从u.u_uisa[8]开始
+   */
 	if(sep)
 	while(ap < &u.u_uisa[8]) {
 		*ap++ = 0;
 		*dp++ = 0;
 	}
+  /*
+   * 映射数据段到物理块 USIZE ~ USIZE + nd - 1
+   * 也是相对物理块
+   */
 	a = USIZE;
 	while(nd >= 128) {
 		*dp++ = (127<<8) | RW;
@@ -218,15 +258,29 @@ estabur(nt, nd, ns, sep)
 		*ap++ = a;
 		a =+ nd;
 	}
+  /*
+   * 并没有判断sep的值就把u．u_uisa[8]/ u．u_uisd[8]中剩余的清0，
+   * 这主要是因为UNIX进程的栈空间是从最高地址涨向低地址的,
+   * 所以需要从最后一组寄存器变量u．u_uisa[7]/u．u_uisd[7]开始设置。
+   */
 	while(ap < &u.u_uisa[8]) {
 		*dp++ = 0;
 		*ap++ = 0;
 	}
+  /*
+   * 针对PDP 11/70芯片的情况做清除处理
+   */
 	if(sep)
 	while(ap < &u.u_uisa[16]) {
 		*dp++ = 0;
 		*ap++ = 0;
 	}
+  /*
+   * 使得a指向栈最高地址块，然后在while循环中从后向前设定寄存器变量
+   * 直到最后剩余块ns<128。
+   *
+   * TODO: 为何要从后向前？
+   */
 	a =+ ns;
 	while(ns >= 128) {
 		a =- 128;
@@ -238,6 +292,10 @@ estabur(nt, nd, ns, sep)
 		*--dp = ((128-ns)<<8) | RW | ED;
 		*--ap = a-128;
 	}
+  /*
+   * 系统如果是PDP 11/40芯片，则最后把前8组寄存器值复制给后8组，
+   * 实际后8组并没有使用。
+   */
 	if(!sep) {
 		ap = &u.u_uisa[0];
 		dp = &u.u_uisa[8];
@@ -248,6 +306,10 @@ estabur(nt, nd, ns, sep)
 		while(ap < &u.u_uisd[8])
 			*dp++ = *ap++;
 	}
+  /*
+   * 调用sureg真正建立用户虚拟空间到物理空间的映射，
+   * 从而改变当前用户空间的物理地址。
+   */
 	sureg();
 	return(0);
 
